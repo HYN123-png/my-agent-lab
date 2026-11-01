@@ -2,18 +2,21 @@ import streamlit as st
 import os
 import requests
 import math
+from openai import OpenAI
 from dotenv import load_dotenv
 
-# 设置网页的标题和图标
 st.set_page_config(page_title="我的专属 AI 助手", page_icon="🤖")
-st.title("🤖 我的专属知识库 AI 助手")
-st.markdown("这是一个基于 RAG 和 大模型构建的智能助手，你可以问它关于【李四】或者【苹果】的问题。")
+st.title("🤖 我的专属知识库 AI 助手 (v2.0 流式版)")
 
+# 加载本地环境变量（用于本地测试），云端会自动读取 Secrets
 load_dotenv()
 ds_key = os.getenv("DEEPSEEK_API_KEY")
 zhipu_key = os.getenv("ZHIPU_API_KEY")
 
-@st.cache_data # 这个装饰器可以让网页记住算好的向量，不用每次都重新算
+# 初始化 DeepSeek 客户端
+client = OpenAI(api_key=ds_key, base_url="https://api.deepseek.com")
+
+@st.cache_data
 def init_data():
     documents = [
         "李四是我们公司的测试工程师。", 
@@ -31,13 +34,12 @@ def init_data():
 
 documents, doc_vectors = init_data()
 
-# 网页上的输入框
 question = st.text_input("请输入你的问题：", placeholder="例如：这水果好吃吗？")
 
 if st.button("发送"):
     if question:
-        with st.spinner("AI 正在思考中..."):
-            # 1. 检索
+        # 1. 检索过程（和之前一样）
+        with st.spinner("正在检索知识库..."):
             url = "https://open.bigmodel.cn/api/paas/v4/embeddings"
             res = requests.post(url, headers={"Authorization": f"Bearer {zhipu_key}"}, json={"model": "embedding-2", "input": question})
             q_vec = res.json()["data"][0]["embedding"]
@@ -50,17 +52,32 @@ if st.button("发送"):
                     best_idx = i
                     
             context = documents[best_idx]
+        
+        # 2. 判断与生成
+        if highest_score < 0.4:
+            st.warning(f"抱歉，知识库中没有找到相关内容。（最高相似度: {highest_score:.2f}）")
+        else:
+            st.info(f"🔍 检索到的参考资料：{context}")
             
-            # 2. 判断与生成
-            if highest_score < 0.4:
-                st.warning(f"抱歉，知识库中没有找到相关内容。（最高相似度: {highest_score:.2f}）")
-            else:
-                st.info(f"🔍 检索到的参考资料：{context}")
-                prompt = f"请根据以下资料回答用户问题：\n资料：{context}"
-                ds_res = requests.post(
-                    "https://api.deepseek.com/chat/completions", 
-                    headers={"Authorization": f"Bearer {ds_key}"}, 
-                    json={"model": "deepseek-chat", "messages": [{"role": "system", "content": prompt}, {"role": "user", "content": question}]}
-                )
-                answer = ds_res.json()["choices"][0]["message"]["content"]
-                st.success(answer)
+            prompt = f"请根据以下资料回答用户问题：\n资料：{context}"
+            
+            # 这就是流式输出的魔法！
+            # 我们调用 OpenAI 库的 create 方法，并加上 stream=True
+            response = client.chat.completions.create(
+                model="deepseek-chat",
+                messages=[
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": question}
+                ],
+                stream=True # 开启流式输出
+            )
+            
+            # 定义一个生成器函数，把收到的文字一块块吐出来
+            def stream_generator():
+                for chunk in response:
+                    if chunk.choices[0].delta.content is not None:
+                        yield chunk.choices[0].delta.content
+            
+            # Streamlit 专属的流式展示组件
+            st.success("🤖 AI 回答：")
+            st.write_stream(stream_generator)

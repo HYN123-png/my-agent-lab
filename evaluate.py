@@ -57,7 +57,7 @@ for case in test_cases:
             
     # 2. 判断（模拟我们在图里的条件边）
     # 如果得分 >= 0.4，我们认为它会给出回答；否则拒答
-    actual_answer = True if highest_score >= 0.6 else False
+    actual_answer = True if highest_score >= 0.4 else False
     
     # 3. 记录结果
     is_correct = (actual_answer == expect)

@@ -83,9 +83,9 @@ def reject_node(state: GraphState):
 
 # ================= 3. 路由函数（判断走哪条路） =================
 def check_relevance(state: GraphState):
-    # 如果最高得分小于 0.6，说明不相关，返回 "reject"
+    # 如果最高得分小于 0.4，说明不相关，返回 "reject"
     # 否则，返回 "generate"
-    if state["score"] < 0.6:
+    if state["score"] < 0.4:
         return "reject"
     return "generate"
 
