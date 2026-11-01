@@ -4,80 +4,81 @@ import requests
 import math
 from openai import OpenAI
 from dotenv import load_dotenv
+from pypdf import PdfReader
 
-st.set_page_config(page_title="我的专属 AI 助手", page_icon="🤖")
-st.title("🤖 我的专属知识库 AI 助手 (v2.0 流式版)")
+st.set_page_config(page_title="文档问答 Agent", page_icon="📄")
+st.title("📄 智能文档分析助手 (v4.0)")
 
-# 加载本地环境变量（用于本地测试），云端会自动读取 Secrets
 load_dotenv()
 ds_key = os.getenv("DEEPSEEK_API_KEY")
 zhipu_key = os.getenv("ZHIPU_API_KEY")
-
-# 初始化 DeepSeek 客户端
 client = OpenAI(api_key=ds_key, base_url="https://api.deepseek.com")
 
-@st.cache_data
-def init_data():
-    documents = [
-        "李四是我们公司的测试工程师。", 
-        "他的主要工作是对新产品进行功能测试和性能测试。",
-        "今天天气真不错，适合出去游玩。",
-        "苹果是一种非常好吃的水果，富含维生素。"
-    ]
-    def get_emb(text):
-        url = "https://open.bigmodel.cn/api/paas/v4/embeddings"
-        res = requests.post(url, headers={"Authorization": f"Bearer {zhipu_key}"}, json={"model": "embedding-2", "input": text})
-        return res.json()["data"][0]["embedding"]
-    
-    doc_vecs = [get_emb(doc) for doc in documents]
-    return documents, doc_vecs
+def get_embedding(text):
+    url = "https://open.bigmodel.cn/api/paas/v4/embeddings"
+    res = requests.post(url, headers={"Authorization": f"Bearer {zhipu_key}"}, json={"model": "embedding-2", "input": text})
+    return res.json()["data"][0]["embedding"]
 
-documents, doc_vectors = init_data()
+def cosine_similarity(vec1, vec2):
+    dot_product = sum(a * b for a, b in zip(vec1, vec2))
+    mag1 = math.sqrt(sum(a * a for a in vec1))
+    mag2 = math.sqrt(sum(b * b for b in vec2))
+    if mag1 == 0 or mag2 == 0: return 0
+    return dot_product / (mag1 * mag2)
 
-question = st.text_input("请输入你的问题：", placeholder="例如：这水果好吃吗？")
+uploaded_file = st.file_uploader("请上传你的文档 (支持 .txt 或 .pdf)", type=["txt", "pdf"])
 
-if st.button("发送"):
-    if question:
-        # 1. 检索过程（和之前一样）
-        with st.spinner("正在检索知识库..."):
-            url = "https://open.bigmodel.cn/api/paas/v4/embeddings"
-            res = requests.post(url, headers={"Authorization": f"Bearer {zhipu_key}"}, json={"model": "embedding-2", "input": question})
-            q_vec = res.json()["data"][0]["embedding"]
-            
-            best_idx, highest_score = -1, -1
-            for i, doc_vec in enumerate(doc_vectors):
-                score = sum(a*b for a,b in zip(q_vec, doc_vec)) / (math.sqrt(sum(a*a for a in q_vec)) * math.sqrt(sum(b*b for b in doc_vec)) or 1)
-                if score > highest_score:
-                    highest_score = score
-                    best_idx = i
-                    
-            context = documents[best_idx]
+if uploaded_file is not None:
+    file_text = ""
+    if uploaded_file.type == "application/pdf":
+        reader = PdfReader(uploaded_file)
+        for page in reader.pages:
+            file_text += page.extract_text() + "\n"
+    else:
+        file_text = uploaded_file.read().decode("utf-8")
         
-        # 2. 判断与生成
-        if highest_score < 0.4:
-            st.warning(f"抱歉，知识库中没有找到相关内容。（最高相似度: {highest_score:.2f}）")
-        else:
-            st.info(f"🔍 检索到的参考资料：{context}")
-            
-            prompt = f"请根据以下资料回答用户问题：\n资料：{context}"
-            
-            # 这就是流式输出的魔法！
-            # 我们调用 OpenAI 库的 create 方法，并加上 stream=True
-            response = client.chat.completions.create(
-                model="deepseek-chat",
-                messages=[
-                    {"role": "system", "content": prompt},
-                    {"role": "user", "content": question}
-                ],
-                stream=True # 开启流式输出
-            )
-            
-            # 定义一个生成器函数，把收到的文字一块块吐出来
-            def stream_generator():
-                for chunk in response:
-                    if chunk.choices[0].delta.content is not None:
-                        yield chunk.choices[0].delta.content
-            
-            # Streamlit 专属的流式展示组件
-            st.success("🤖 AI 回答：")
-            st.write_stream(stream_generator)
+    chunks = [c.strip() for c in file_text.split("\n") if len(c.strip()) > 10]
+    
+    if len(chunks) == 0:
+        st.warning("文件内容似乎为空，或者没有足够长的段落。")
+    else:
+        st.success(f"文件已成功读取，共切分为 {len(chunks)} 个段落。")
+        
+        question = st.text_input("请输入关于这份文档的问题：")
+        
+        if st.button("发送"):
+            if question:
+                with st.spinner("正在检索文档内容..."):
+                    q_vec = get_embedding(question)
+                    
+                    best_idx, highest_score = -1, -1
+                    for i, chunk in enumerate(chunks):
+                        chunk_vec = get_embedding(chunk)
+                        score = cosine_similarity(q_vec, chunk_vec)
+                        if score > highest_score:
+                            highest_score = score
+                            best_idx = i
+                    
+                    context = chunks[best_idx]
+                
+                if highest_score < 0.4:
+                    st.warning(f"抱歉，文档中似乎没有相关内容。（最高相似度: {highest_score:.2f}）")
+                else:
+                    with st.expander("🔍 展开查看检索到的原文档段落"):
+                        st.write(context)
+                        
+                    prompt = f"请严格根据以下文档片段回答用户问题：\n文档片段：{context}\n\n问题：{question}"
+                    
+                    response = client.chat.completions.create(
+                        model="deepseek-chat",
+                        messages=[{"role": "system", "content": prompt}],
+                        stream=True
+                    )
+                    
+                    def stream_generator():
+                        for chunk in response:
+                            if chunk.choices[0].delta.content is not None:
+                                yield chunk.choices[0].delta.content
+                    
+                    st.success("🤖 AI 回答：")
+                    st.write_stream(stream_generator)
