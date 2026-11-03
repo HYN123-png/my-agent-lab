@@ -4,14 +4,16 @@ import re
 import requests
 import numpy as np
 import jieba
+from typing import TypedDict, List
 from openai import OpenAI
 from dotenv import load_dotenv
 from pypdf import PdfReader
 import chromadb
 from rank_bm25 import BM25Okapi
+from langgraph.graph import StateGraph, END
 
-st.set_page_config(page_title="企业级混合检索 Agent", page_icon="🚀")
-st.title("🚀 企业级文档分析助手 (v7.2 稳定版)")
+st.set_page_config(page_title="Agentic RAG 智能体", page_icon="🤖")
+st.title("🤖 Agentic RAG 文档助手 (v8.0)")
 
 load_dotenv()
 ds_key = os.getenv("DEEPSEEK_API_KEY")
@@ -36,92 +38,175 @@ def rrf_fuse(list1, list2, k=60):
         scores[doc] = scores.get(doc, 0) + 1.0 / (k + rank + 1)
     return [doc for doc, score in sorted(scores.items(), key=lambda x: x[1], reverse=True)]
 
-# ================= 2. 网页交互与数据处理 =================
-uploaded_file = st.file_uploader("请上传你的文档 (支持 .txt 或 .pdf)", type=["txt", "pdf"])
+# ================= 2. 定义 LangGraph 的状态与节点 =================
+class RAGState(TypedDict):
+    question: str
+    rewritten_question: str
+    context: str
+    is_relevant: str  # 用 'yes' 或 'no' 表示
+    retries: int
+    answer: str
+    history: List[dict]
+
+# 全局检索器（在文件上传后赋值）
+collection = None
+bm25 = None
+chunks_global = []
+
+def retrieve_node(state: RAGState):
+    query = state.get("rewritten_question") or state["question"]
+    
+    # 混合检索（向量 + BM25 + RRF）
+    q_vec = get_embedding(query)
+    vector_chunks = collection.query(query_embeddings=[q_vec], n_results=20)['documents'][0]
+    
+    tokenized_q = tokenize(query)
+    bm25_scores = bm25.get_scores(tokenized_q)
+    top_bm25_indices = np.argsort(bm25_scores)[-20:][::-1]
+    bm25_chunks = [chunks_global[i] for i in top_bm25_indices if bm25_scores[i] > 0]
+    
+    fused = rrf_fuse(vector_chunks, bm25_chunks)
+    top_6 = fused[:6]
+    context = "\n\n---\n\n".join(top_6)
+    
+    return {"context": context}
+
+def grade_node(state: RAGState):
+    # 让大模型判断检索到的资料是否与问题相关
+    prompt = f"请判断以下【检索资料】能否回答【用户问题】。如果能，只输出 'yes'；如果不能，只输出 'no'。\n\n【用户问题】：{state['question']}\n\n【检索资料】：{state['context']}"
+    res = client.chat.completions.create(
+        model="deepseek-chat",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0
+    ).choices[0].message.content.strip().lower()
+    
+    is_rel = "yes" if "yes" in res else "no"
+    return {"is_relevant": is_rel}
+
+def rewrite_node(state: RAGState):
+    # 如果资料不相关，让大模型重写问题，提取更精准的关键词
+    prompt = f"用户的原问题是：{state['question']}。\n由于当前知识库检索不到相关内容，请将原问题重写为一个更简短、包含更多核心关键词的搜索词，直接输出重写后的问题，不要任何废话。"
+    new_q = client.chat.completions.create(
+        model="deepseek-chat",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.5
+    ).choices[0].message.content.strip()
+    
+    return {
+        "rewritten_question": new_q,
+        "retries": state.get("retries", 0) + 1
+    }
+
+def generate_node(state: RAGState):
+    # 融合历史记录和上下文生成答案
+    system_prompt = f"请根据以下文档片段回答用户问题。如果资料中没提到，请直接说不知道。\n\n文档片段：\n{state['context']}"
+    
+    messages = [{"role": "system", "content": system_prompt}]
+    # 加入最近 3 轮的历史对话（多轮记忆）
+    for msg in state.get("history", [])[-6:]:
+        messages.append(msg)
+    messages.append({"role": "user", "content": state["question"]})
+    
+    res = client.chat.completions.create(
+        model="deepseek-chat",
+        messages=messages,
+        stream=True
+    )
+    
+    # 这里为了简化状态图，我们直接把完整答案生成出来
+    answer = ""
+    for chunk in res:
+        if chunk.choices[0].delta.content:
+            answer += chunk.choices[0].delta.content
+            
+    return {"answer": answer}
+
+def route_after_grade(state: RAGState):
+    if state["is_relevant"] == "yes":
+        return "generate"
+    if state.get("retries", 0) >= 2:
+        return "generate" # 重试两次还不行，就直接强行生成（或拒答）
+    return "rewrite"
+
+# ================= 3. 构建图 =================
+workflow = StateGraph(RAGState)
+workflow.add_node("retrieve", retrieve_node)
+workflow.add_node("grade", grade_node)
+workflow.add_node("rewrite", rewrite_node)
+workflow.add_node("generate", generate_node)
+
+workflow.set_entry_point("retrieve")
+workflow.add_edge("retrieve", "grade")
+workflow.add_conditional_edges("grade", route_after_grade, {
+    "generate": "generate",
+    "rewrite": "rewrite"
+})
+workflow.add_edge("rewrite", "retrieve")
+workflow.add_edge("generate", END)
+
+app_graph = workflow.compile()
+
+# ================= 4. Streamlit 网页界面 =================
+# 初始化 session_state 用于保存多轮对话历史
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+uploaded_file = st.file_uploader("请上传你的文档", type=["txt", "pdf"])
 
 if uploaded_file is not None:
+    # 处理文档...（这里省略了部分繁琐的解析，和之前一样）
     file_text = ""
     if uploaded_file.type == "application/pdf":
         reader = PdfReader(uploaded_file)
-        for page in reader.pages:
-            file_text += page.extract_text() + "\n"
+        for page in reader.pages: file_text += page.extract_text() + "\n"
     else:
         file_text = uploaded_file.read().decode("utf-8")
         
-    chunk_size = 400
-    chunk_overlap = 50
-    chunks = []
-    for i in range(0, len(file_text), chunk_size - chunk_overlap):
-        chunk = file_text[i:i + chunk_size].strip()
-        if len(chunk) > 20:
-            chunks.append(chunk)
+    chunks_global = [file_text[i:i+400].strip() for i in range(0, len(file_text), 350) if len(file_text[i:i+400].strip()) > 20]
     
-    if len(chunks) == 0:
-        st.warning("文件内容太短或为空。")
-    else:
-        st.success(f"文件读取成功，共切分为 {len(chunks)} 个长段落。")
-        
-        @st.cache_resource(show_spinner="正在将文档写入向量数据库...")
-        def build_vector_db(file_name, chunks_list):
-            chroma_client = chromadb.Client()
-            collection = chroma_client.create_collection(name="my_docs")
-            for i, chunk in enumerate(chunks_list):
-                vector = get_embedding(chunk)
-                collection.add(embeddings=[vector], documents=[chunk], ids=[f"id_{i}"])
-            return collection
+    @st.cache_resource(show_spinner="正在构建数据库...")
+    def build_db(chunks_list):
+        chroma_client = chromadb.Client()
+        col = chroma_client.create_collection(name="my_docs")
+        for i, chunk in enumerate(chunks_list):
+            col.add(embeddings=[get_embedding(chunk)], documents=[chunk], ids=[f"id_{i}"])
+        bm25_obj = BM25Okapi([tokenize(c) for c in chunks_list])
+        return col, bm25_obj
 
-        collection = build_vector_db(uploaded_file.name, chunks)
-        
-        @st.cache_resource
-        def build_bm25(chunks_list):
-            tokenized_chunks = [tokenize(c) for c in chunks_list]
-            return BM25Okapi(tokenized_chunks)
-            
-        bm25 = build_bm25(chunks)
+    collection, bm25 = build_db(chunks_global)
+    st.success(f"文档已加载，共 {len(chunks_global)} 个段落。")
 
-        question = st.text_input("请输入关于这份文档的问题：")
-        
-        if st.button("发送"):
-            if question:
-                with st.spinner("正在进行混合检索..."):
-                    
-                    # 1. 语义检索
-                    q_vec = get_embedding(question)
-                    vector_results = collection.query(query_embeddings=[q_vec], n_results=20)
-                    vector_chunks = vector_results['documents'][0]
-                    
-                    # 2. 关键词检索 (BM25)
-                    tokenized_q = tokenize(question)
-                    bm25_scores = bm25.get_scores(tokenized_q)
-                    top_bm25_indices = np.argsort(bm25_scores)[-20:][::-1]
-                    bm25_chunks = [chunks[i] for i in top_bm25_indices if bm25_scores[i] > 0]
-                    
-                    # 3. RRF 融合
-                    fused_chunks = rrf_fuse(vector_chunks, bm25_chunks)
-                    
-                    # 直接取融合后的前 6 个
-                    final_chunks = fused_chunks[:6]
-                        
-                    context = "\n\n---\n\n".join(final_chunks)
+    # 渲染历史对话
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    # 聊天输入框
+    if prompt := st.chat_input("针对这份文档，你可以连续提问..."):
+        # 显示用户提问
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Agent 正在思考（检索、评估、自我纠错中）..."):
+                # 调用 LangGraph
+                inputs = {
+                    "question": prompt,
+                    "rewritten_question": "",
+                    "retries": 0,
+                    "history": st.session_state.messages[:-1] # 历史记录
+                }
+                result = app_graph.invoke(inputs)
                 
-                if not context:
-                    st.warning("抱歉，没有找到相关内容。")
-                else:
-                    with st.expander("🔍 展开查看混合检索后的 Top-6 精选段落"):
-                        st.write(context)
-                        
-                    prompt = f"请仔细阅读以下文档片段，并全面、完整地回答用户问题。如果需要罗列多个事项，请尽量穷尽片段中的所有细节。\n\n文档片段：\n{context}\n\n问题：{question}"
-                    
-                    response = client.chat.completions.create(
-                        model="deepseek-chat",
-                        messages=[{"role": "system", "content": prompt}],
-                        stream=True
-                    )
-                    
-                    def stream_generator():
-                        for chunk in response:
-                            if chunk.choices[0].delta.content is not None:
-                                yield chunk.choices[0].delta.content
-                    
-                    st.success("🤖 AI 回答：")
-                    st.write_stream(stream_generator)
+                final_answer = result["answer"]
+                st.markdown(final_answer)
+                
+                # 展开查看检索到的上下文
+                with st.expander("🔍 查看本轮内部检索逻辑"):
+                    if result.get("rewritten_question"):
+                        st.write(f"⚠️ **触发了自我纠错！** 原问题检索失败，Agent 已将问题重写为：`{result['rewritten_question']}`")
+                    st.write(result["context"])
+                
+        # 保存 AI 回答到历史
+        st.session_state.messages.append({"role": "assistant", "content": final_answer})
