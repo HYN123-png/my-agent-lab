@@ -2,6 +2,7 @@ streamlit
 openai
 requests
 python-dotenv
+python-docx
 pypdf
 chromadb>=1.5.0
 rank_bm25
