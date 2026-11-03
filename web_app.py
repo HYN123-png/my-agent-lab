@@ -1,3 +1,6 @@
+import pandas as pd
+from pptx import Presentation
+import io
 import streamlit as st
 import os
 import re
@@ -14,7 +17,7 @@ from rank_bm25 import BM25Okapi
 from langgraph.graph import StateGraph, END
 
 st.set_page_config(page_title="企业级 Agentic RAG", page_icon="🤖")
-st.title("🤖 企业级 Agentic RAG 智能体 (v8.2)")
+st.title("🤖 企业级 Agentic RAG 智能体 (v8.5)")
 
 load_dotenv()
 ds_key = os.getenv("DEEPSEEK_API_KEY")
@@ -39,7 +42,7 @@ def rrf_fuse(list1, list2, k=60):
         scores[doc] = scores.get(doc, 0) + 1.0 / (k + rank + 1)
     return [doc for doc, score in sorted(scores.items(), key=lambda x: x[1], reverse=True)]
 
-# ================= 2. 多格式文档解析 =================
+# ================= 2. 新增：多格式文档解析与切块 =================
 def extract_text_from_file(file):
     filename = file.name.lower()
     text = ""
@@ -52,6 +55,23 @@ def extract_text_from_file(file):
             doc = docx.Document(file)
             for para in doc.paragraphs:
                 text += para.text + "\n"
+            for table in doc.tables:
+                for row in table.rows:
+                    text += " | ".join([cell.text.strip() for cell in row.cells]) + "\n"
+                text += "\n"
+        elif filename.endswith(".xlsx") or filename.endswith(".xls"):
+            df = pd.read_excel(file)
+            text = df.to_markdown(index=False)
+        elif filename.endswith(".pptx"):
+            prs = Presentation(file)
+            for i, slide in enumerate(prs.slides):
+                text += f"\n--- 第 {i+1} 页幻灯片 ---\n"
+                for shape in slide.shapes:
+                    if shape.has_text_frame:
+                        text += shape.text + "\n"
+                    if shape.has_table:
+                        for row in shape.table.rows:
+                            text += " | ".join([cell.text.strip() for cell in row.cells]) + "\n"
         elif filename.endswith(".txt") or filename.endswith(".md"):
             text = file.read().decode("utf-8")
     except Exception as e:
@@ -62,7 +82,8 @@ def process_files(uploaded_files):
     all_chunks = []
     for file in uploaded_files:
         raw_text = extract_text_from_file(file)
-        if not raw_text.strip(): continue
+        if not raw_text.strip():
+            continue
         chunk_size = 400
         chunk_overlap = 50
         for i in range(0, len(raw_text), chunk_size - chunk_overlap):
@@ -70,7 +91,6 @@ def process_files(uploaded_files):
             if len(chunk) > 20:
                 all_chunks.append(f"【来源文档：{file.name}】\n{chunk}")
     return all_chunks
-
 # ================= 3. LangGraph 节点 =================
 class RAGState(TypedDict):
     question: str
@@ -100,7 +120,36 @@ def retrieve_node(state: RAGState):
     bm25_chunks = [chunks[i] for i in top_bm25_indices if bm25_scores[i] > 0]
     
     fused = rrf_fuse(vector_chunks, bm25_chunks)
-    context = "\n\n---\n\n".join(fused[:6])
+    
+    # ================= 核心升级：按文件配额提取 =================
+    # 取出当前上传的所有文件列表
+    files_list = st.session_state.get("current_files", [])
+    
+    # 按文件分组
+    file_groups = {f: [] for f in files_list}
+    for chunk in fused:
+        # 从咱们之前打的标签里提取文件名
+        match = re.search(r"【来源文档：(.*?)】", chunk)
+        if match:
+            source_file = match.group(1)
+            if source_file in file_groups:
+                file_groups[source_file].append(chunk)
+    
+    # 每个文件最多强制取 4 个片段（这样即使有10个文件，也能覆盖到）
+    final_chunks = []
+    for f, chunks in file_groups.items():
+        final_chunks.extend(chunks[:4])
+        
+    # 如果配额加起来不到 12 个，再从全局融合结果里补足
+    if len(final_chunks) < 12:
+        for chunk in fused:
+            if chunk not in final_chunks:
+                final_chunks.append(chunk)
+            if len(final_chunks) >= 12:
+                break
+                
+    context = "\n\n---\n\n".join(final_chunks)
+    # ========================================================
     return {"context": context}
 
 def grade_node(state: RAGState):
@@ -118,7 +167,21 @@ def rewrite_node(state: RAGState):
     return {"rewritten_question": new_q, "retries": state.get("retries", 0) + 1}
 
 def generate_node(state: RAGState):
-    system_prompt = f"请根据以下文档片段回答用户问题。如果资料中没提到，请直接说不知道。请尽量引用来源文档名称。\n\n文档片段：\n{state['context']}"
+        # 获取当前上传的所有文件名
+    file_list = ", ".join(st.session_state.get("current_files", []))
+    
+    system_prompt = f"""你是一个严谨的企业级文档分析助手。
+当前用户上传的文档清单如下：
+[{file_list}]
+
+请仔细阅读以下检索到的【文档片段】来回答用户问题。
+注意：
+1. 如果用户的问题涉及上述清单中的某个文件，但你在【文档片段】中找不到该文件的内容，请明确告诉用户：“由于片段限制，我没有检索到该文件的相关细节”。
+2. 如果资料中完全没提到，请直接说不知道。
+3. 回答时，请务必标注每一条信息的来源文档名称。
+
+【文档片段】：
+{state['context']}"""
     messages = [{"role": "system", "content": system_prompt}]
     for msg in state.get("history", [])[-6:]:
         messages.append(msg)
@@ -154,8 +217,8 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 
 uploaded_files = st.file_uploader(
-    "请上传你的文档 (支持 PDF, Word, TXT, MD，可多选)", 
-    type=["txt", "pdf", "docx", "md"], 
+    "请上传你的文档 (支持 PDF, Word, TXT, MD, PPT, Excel，可多选)", 
+    type=["txt", "pdf", "docx", "md", "pptx", "xlsx", "xls"], 
     accept_multiple_files=True
 )
 
