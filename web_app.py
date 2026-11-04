@@ -125,7 +125,13 @@ def rewrite_query_with_history(state: RAGState):
         return {"standalone_query": state["question"]}
     
     history_str = "\n".join([f"{m['role']}: {m['content']}" for m in history[-4:]])
-    prompt = f"根据以下对话历史，将用户的最后一个问题重写为一个独立的、包含完整上下文的查询语句。只输出重写后的句子，不要任何废话。\n\n历史：\n{history_str}\n最后问题：{state['question']}\n独立查询："
+    # 强调保留“结合文档”等关键意图
+    prompt = f"""根据以下对话历史，将用户的最后一个问题重写为一个独立的、包含完整上下文的查询语句。
+要求：如果用户提到了“根据文档”、“结合上文”等，必须在重写结果中保留这些意图。只输出重写后的句子，不要废话。
+历史：
+{history_str}
+最后问题：{state['question']}
+独立查询："""
     try:
         res = client.chat.completions.create(model="deepseek-chat", messages=[{"role": "user", "content": prompt}], temperature=0)
         q = res.choices[0].message.content.strip()
@@ -194,34 +200,53 @@ def web_search_node(state: RAGState):
         valid_results = [r for r in response.get("results", []) if r.get("content")]
         if not valid_results:
             return {"context": f"【网络搜索】未找到关于 '{query}' 的有效结果。", "is_relevant": "yes"}
-        web_context = "\n\n".join([f"【来源网页：{r['url']}】\n{r['content']}" for r in valid_results])
+        
+        # 【核心清洗】：只取每个网页正文的前 500 个字符，直接扔掉网页底部的导航和广告
+        web_context = "\n\n".join([f"【来源网页：{r['url']}】\n{r['content'][:500]}" for r in valid_results])
         return {"context": web_context, "is_relevant": "yes"}
     except Exception as e:
         return {"context": f"【网络搜索报错：{str(e)}】", "is_relevant": "yes"}
 
 def research_node(state: RAGState):
-    safe_context = state['context'][:8000]
-    if "【网络搜索" in state["context"] and len(safe_context) < 100: # 拦截报错
+    safe_context = state['context'][:3000] 
+    
+    if "【网络搜索" in state["context"] and len(safe_context) < 150:
         return {"answer": f"⚠️ {safe_context}"}
         
-    # 联网短查询直接吐结果
     if "【来源网页：" in state["context"]:
-        return {"answer": f"[[DIRECT]]\n根据联网搜索结果，为您找到以下信息：\n\n{safe_context}"}
-        
-    # 本地文档提炼
+        prompt = f"""你是一个极简的搜索问答助手。请根据以下搜索片段，直接提取出用户问题的核心答案。
+要求：如果查到了数据，直接给结果。如果没有查到确切数据（比如金价、油价），直接回答“未搜索到最新实时数据，请换个问法或稍后再试”。绝对不要编造或写空报告。
+
+搜索片段：
+{safe_context}
+
+用户问题：{state['question']}
+答案："""
+        try:
+            res = client.chat.completions.create(model="deepseek-chat", messages=[{"role": "user", "content": prompt}], temperature=0)
+            draft = res.choices[0].message.content
+            if not draft or not draft.strip():
+                return {"answer": f"根据网络检索，为您找到以下参考信息：\n{safe_context[:200]}..."}
+            # 【核心修复】：如果是联网短查询，打上 [[DIRECT]] 标记，强制不排版！
+            return {"answer": f"[[DIRECT]]\n{draft}"}
+        except Exception:
+            return {"answer": f"[[DIRECT]]\n根据网络检索，为您找到以下参考信息：\n{safe_context[:200]}..."}
+
+    # 处理本地文档
     prompt = f"提取核心事实整理成大纲。\n资料：\n{safe_context}"
     messages = [{"role": "system", "content": prompt}] + state.get("history", [])[-4:] + [{"role": "user", "content": state["question"]}]
     try:
         res = client.chat.completions.create(model="deepseek-chat", messages=messages)
-        draft = res.choices[0].message.content
-        return {"answer": draft if draft else f"提取失败，原文如下：\n{safe_context}"}
+        return {"answer": res.choices[0].message.content}
     except Exception as e:
-        return {"answer": f"⚠️ 总结失败（{e}），原文如下：\n{safe_context}"}
+        return {"answer": f"⚠️ 本地文档解析失败：{e}"}
 
 def writer_node(state: RAGState):
     ans = state.get("answer", "")
     if not ans: return {"answer": "未生成任何内容。"}
-    if "[[DIRECT]]" in ans or "⚠️" in ans:
+    
+    # 【核心修复】：认出 [[DIRECT]] 标记，或者非常短的文本，直接原样返回，不加排版！
+    if "[[DIRECT]]" in ans or len(ans) < 100:
         return {"answer": ans.replace("[[DIRECT]]\n", "")}
         
     prompt = f"作为商业报告主编，请排版以下大纲。\n问题：{state['question']}\n大纲：{ans}"
