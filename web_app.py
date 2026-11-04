@@ -125,9 +125,12 @@ def rewrite_query_with_history(state: RAGState):
         return {"standalone_query": state["question"]}
     
     history_str = "\n".join([f"{m['role']}: {m['content']}" for m in history[-4:]])
-    # 强调保留“结合文档”等关键意图
     prompt = f"""根据以下对话历史，将用户的最后一个问题重写为一个独立的、包含完整上下文的查询语句。
-要求：如果用户提到了“根据文档”、“结合上文”等，必须在重写结果中保留这些意图。只输出重写后的句子，不要废话。
+【核心规则】：
+1. 如果用户的最后问题是“那明天呢”、“未来7天呢”、“后天呢”，必须结合历史记录，补全城市或实体名称！（例如：如果历史在聊南昌天气，重写结果必须是“南昌未来7天天气”）。
+2. 如果用户提到了“根据文档”、“结合上文”，必须在重写结果中保留。
+3. 只输出重写后的句子，绝对不要任何解释。
+
 历史：
 {history_str}
 最后问题：{state['question']}
@@ -221,8 +224,9 @@ def research_node(state: RAGState):
         return {"answer": f"⚠️ {safe_context}"}
         
     if "【来源网页：" in state["context"]:
-        prompt = f"""你是一个极简的搜索问答助手。请根据以下搜索片段，直接提取出用户问题的核心答案。
-要求：如果查到了数据，直接给结果。如果没有查到确切数据（比如金价、油价），直接回答“未搜索到最新实时数据，请换个问法或稍后再试”。绝对不要编造或写空报告。
+        # 【放宽常识判断】：允许大模型根据自己的常识和搜索片段结合回答
+        prompt = f"""你是一个智能问答助手。请根据以下搜索片段，回答用户的问题。
+要求：如果片段中有具体数据，直接给数据。如果是常识类问题（如穿什么衣服），请结合片段和你的常识给出合理建议。如果没有查到任何相关的信息，才回答“未搜索到最新数据”。
 
 搜索片段：
 {safe_context}
@@ -233,8 +237,7 @@ def research_node(state: RAGState):
             res = client.chat.completions.create(model="deepseek-chat", messages=[{"role": "user", "content": prompt}], temperature=0)
             draft = res.choices[0].message.content
             if not draft or not draft.strip():
-                return {"answer": f"根据网络检索，为您找到以下参考信息：\n{safe_context[:200]}..."}
-            # 【核心修复】：如果是联网短查询，打上 [[DIRECT]] 标记，强制不排版！
+                return {"answer": f"[[DIRECT]]\n根据网络检索，为您找到以下参考信息：\n{safe_context[:200]}..."}
             return {"answer": f"[[DIRECT]]\n{draft}"}
         except Exception:
             return {"answer": f"[[DIRECT]]\n根据网络检索，为您找到以下参考信息：\n{safe_context[:200]}..."}
