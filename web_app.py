@@ -176,6 +176,13 @@ def retrieve_node(state: RAGState):
 def grade_node(state: RAGState):
     if "【无本地文档】" in state["context"]:
         return {"is_relevant": "no"}
+        
+    # 【核心强制】：如果问题或重写后的问题里包含“结合文档”、“根据资料”等词，强制认为相关
+    q_check = state.get("standalone_query", "") + state["question"]
+    force_local_keywords = ["结合文档", "根据文档", "根据资料", "结合资料", "文中", "根据上文"]
+    if any(kw in q_check for kw in force_local_keywords):
+        return {"is_relevant": "yes"}
+
     prompt = f"请判断【资料】能否回答【问题】。如果涉及主观总结/写报告，只要相关就输出'yes'。只输出'yes'或'no'。\n\n【问题】：{state['question']}\n【资料】：{state['context'][:2000]}"
     try:
         res = client.chat.completions.create(model="deepseek-chat", messages=[{"role": "user", "content": prompt}], temperature=0)
@@ -259,6 +266,13 @@ def writer_node(state: RAGState):
 
 def route_after_grade(state: RAGState):
     if "【无本地文档】" in state["context"]: return "web_search"
+    
+    # 如果是强制本地问题，直接去 research，绝对不准去联网
+    q_check = state.get("standalone_query", "") + state["question"]
+    force_local_keywords = ["结合文档", "根据文档", "根据资料", "结合资料", "文中", "根据上文"]
+    if any(kw in q_check for kw in force_local_keywords):
+        return "research"
+
     if state["is_relevant"] == "yes": return "research"
     if state.get("retries", 0) >= 1: return "web_search"
     return "rewrite"
