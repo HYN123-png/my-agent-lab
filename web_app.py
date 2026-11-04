@@ -124,6 +124,8 @@ class RAGState(TypedDict):
     history: List[dict]
 
 def retrieve_node(state: RAGState):
+    if not st.session_state.get("current_files"):
+        return {"context": "【无本地文档】当前没有上传任何文件，请直接回答或联网搜索。"}
     col = st.session_state.get("collection")
     bm = st.session_state.get("bm25")
     chunks = st.session_state.get("chunks_global", [])
@@ -155,6 +157,8 @@ def retrieve_node(state: RAGState):
             if len(final_chunks) >= 12: break
                 
     return {"context": "\n\n---\n\n".join(final_chunks)}
+    if "【无本地文档】" in state["context"]:
+        return {"is_relevant": "no"}
 
 def grade_node(state: RAGState):
     prompt = f"请判断以下【检索资料】能否回答【用户问题】。如果能，只输出 'yes'；如果不能，只输出 'no'。\n\n【用户问题】：{state['question']}\n\n【检索资料】：{state['context']}"
@@ -193,17 +197,26 @@ def web_search_node(state: RAGState):
 
 def generate_node(state: RAGState):
     file_list = ", ".join(st.session_state.get("current_files", []))
-    system_prompt = f"""你是一个严谨的企业级文档分析助手。
-当前用户上传的文档清单如下：
-[{file_list}]
+    
+    # 【核心升级】：判断检索到的信息是来自网络还是本地
+    if "【来源网页：" in state["context"]:
+        source_info = "网络实时搜索结果（请务必在回答中标注这是网络来源，并附带链接）"
+    elif "【无本地文档】" in state["context"]:
+        source_info = "无（因为用户没有上传文件）"
+    else:
+        source_info = "用户上传的本地文档片段（请标注来源文件名）"
+        
+    system_prompt = f"""你是一个严谨的AI助手。
+当前用户上传的本地文件清单：[{file_list if file_list else '无'}]
 
-请仔细阅读以下检索到的【文档片段】来回答用户问题。
+当前为你提供的参考资料来源于：{source_info}。
+请仔细阅读以下【参考资料】来回答用户问题。
+
 注意：
-1. 如果用户的问题涉及上述清单中的某个文件，但你在【文档片段】中找不到该文件的内容，请明确告诉用户：“由于片段限制，我没有检索到该文件的相关细节”。
-2. 如果资料中完全没提到，请直接说不知道。
-3. 回答时，请务必标注每一条信息的来源名称。
+1. 如果资料中完全没提到相关信息，请直接说不知道，绝对不能凭空编造。
+2. 必须如实标注每一条信息的出处（是网页网址，还是本地文件名）。
 
-【文档片段】：
+【参考资料】：
 {state['context']}"""
     
     messages = [{"role": "system", "content": system_prompt}]
@@ -269,32 +282,44 @@ if uploaded_files:
                 st.session_state.current_files = current_file_names
                 st.success(f"成功加载 {len(uploaded_files)} 份文档，共切分 {len(chunks_global)} 个知识块。")
 
-    for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]): st.markdown(msg["content"])
+    # ================= 核心修改：将聊天界面独立出来 =================
+# 无论有没有上传文件，都渲染聊天历史
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]): 
+        st.markdown(msg["content"])
 
-    if prompt := st.chat_input("你可以针对这些文档连续提问..."):
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"): st.markdown(prompt)
+# 无论有没有上传文件，都显示输入框
+if prompt := st.chat_input("你可以针对文档提问，或者直接让我上网查资料..."):
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"): 
+        st.markdown(prompt)
 
-        with st.chat_message("assistant"):
-            with st.spinner("Agent 正在多文档检索、评估与思考..."):
-                inputs = {"question": prompt, "rewritten_question": "", "retries": 0, "history": st.session_state.messages[:-1]}
-                result = app_graph.invoke(inputs)
-                st.markdown(result["answer"])
+    with st.chat_message("assistant"):
+        with st.spinner("Agent 正在思考与检索..."):
+            # 准备传给 LangGraph 的输入
+            inputs = {
+                "question": prompt, 
+                "rewritten_question": "", 
+                "retries": 0, 
+                # 把前几轮的对话传进去，这就是多轮记忆的核心
+                "history": st.session_state.messages[:-1] 
+            }
+            
+            result = app_graph.invoke(inputs)
+            st.markdown(result["answer"])
+            
+            # 渲染下载按钮
+            if result["answer"]:
+                st.download_button(
+                    label="📥 下载这份总结 (Markdown格式)",
+                    data=result["answer"].encode('utf-8'),
+                    file_name="AI_分析报告.md",
+                    mime="text/markdown"
+                )
                 
-                # ================= 新增：一键导出下载功能 =================
-                if result["answer"]:
-                    st.download_button(
-                        label="📥 下载这份总结 (Markdown格式)",
-                        data=result["answer"].encode('utf-8'),
-                        file_name="AI_分析报告.md",
-                        mime="text/markdown"
-                    )
-                # ==========================================================
-
-                with st.expander("🔍 查看本轮内部检索逻辑"):
-                    if result.get("rewritten_question"):
-                        st.write(f"⚠️ **触发了自我纠错！** 重写为：`{result['rewritten_question']}`")
-                    st.write(result["context"])
-                    
-        st.session_state.messages.append({"role": "assistant", "content": result["answer"]})
+            with st.expander("🔍 查看本轮内部检索逻辑"):
+                if result.get("rewritten_question"):
+                    st.write(f"⚠️ **触发了自我纠错！** 重写为：`{result['rewritten_question']}`")
+                st.write(result["context"])
+                
+    st.session_state.messages.append({"role": "assistant", "content": result["answer"]})
