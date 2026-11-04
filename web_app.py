@@ -15,7 +15,7 @@ from pypdf import PdfReader
 import chromadb
 from rank_bm25 import BM25Okapi
 from langgraph.graph import StateGraph, END
-from duckduckgo_search import DDGS
+from tavily import TavilyClient
 
 st.set_page_config(page_title="企业级 Agentic RAG", page_icon="🤖")
 st.title("🤖 企业级 Agentic RAG 智能体 (v8.5)")
@@ -24,6 +24,7 @@ load_dotenv()
 ds_key = os.getenv("DEEPSEEK_API_KEY")
 zhipu_key = os.getenv("ZHIPU_API_KEY")
 client = OpenAI(api_key=ds_key, base_url="https://api.deepseek.com")
+tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 
 # ================= 1. 基础函数 =================
 def get_embedding(text):
@@ -170,13 +171,22 @@ def rewrite_node(state: RAGState):
     return {"rewritten_question": new_q, "retries": state.get("retries", 0) + 1}
 
 def web_search_node(state: RAGState):
+    """如果本地知识库搞不定，就去互联网上搜索"""
     query = state.get("rewritten_question") or state["question"]
+    
     try:
-        with DDGS() as ddgs:
-            results = list(ddgs.text(query, max_results=3))
+        # 调用 Tavily 专业搜索
+        response = tavily_client.search(query=query, search_depth="basic", max_results=3)
+        results = response.get("results", [])
+        
         if not results:
             return {"context": "【网络搜索】未找到相关网页结果。", "is_relevant": "yes"}
-        web_context = "\n\n".join([f"【来源网页：{r['href']}】\n{r['body']}" for r in results])
+            
+        # 把网页内容拼成上下文
+        web_context = "\n\n".join([
+            f"【来源网页：{r['url']}】\n{r['content']}" for r in results
+        ])
+        
         return {"context": web_context, "is_relevant": "yes"}
     except Exception as e:
         return {"context": f"【网络搜索失败：{e}】", "is_relevant": "yes"}
@@ -271,8 +281,20 @@ if uploaded_files:
                 inputs = {"question": prompt, "rewritten_question": "", "retries": 0, "history": st.session_state.messages[:-1]}
                 result = app_graph.invoke(inputs)
                 st.markdown(result["answer"])
+                
+                # ================= 新增：一键导出下载功能 =================
+                if result["answer"]:
+                    st.download_button(
+                        label="📥 下载这份总结 (Markdown格式)",
+                        data=result["answer"].encode('utf-8'),
+                        file_name="AI_分析报告.md",
+                        mime="text/markdown"
+                    )
+                # ==========================================================
+
                 with st.expander("🔍 查看本轮内部检索逻辑"):
                     if result.get("rewritten_question"):
                         st.write(f"⚠️ **触发了自我纠错！** 重写为：`{result['rewritten_question']}`")
                     st.write(result["context"])
+                    
         st.session_state.messages.append({"role": "assistant", "content": result["answer"]})
