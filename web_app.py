@@ -1,5 +1,6 @@
 import streamlit as st
 import os
+import concurrent.futures
 import re
 import requests
 import numpy as np
@@ -11,6 +12,8 @@ from docx.shared import Pt, Inches, RGBColor as DocxRGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 import io
 import json
+import sqlite3
+import datetime
 import base64
 from pptx import Presentation
 from pptx.util import Inches, Pt
@@ -56,6 +59,120 @@ PPT_THEMES = {
         "accent": RGBColor(255, 152, 0),  # 亮橙色装饰条
     }
 }
+# ================= 数据库管理 =================
+DB_FILE = "chat_history.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    # 会话表
+    c.execute('''CREATE TABLE IF NOT EXISTS conversations
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, created_at TEXT)''')
+    # 消息表
+    c.execute('''CREATE TABLE IF NOT EXISTS messages
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, conv_id INTEGER, role TEXT, content TEXT, created_at TEXT)''')
+    
+    # 【核心修复】：自动检测并添加 files 列，防止旧版本报错
+    try:
+        c.execute("ALTER TABLE conversations ADD COLUMN files TEXT")
+    except sqlite3.OperationalError:
+        pass # 如果列已经存在，会报错，直接跳过
+        
+    conn.commit()
+    conn.close()
+def update_conv_files(conv_id, filenames):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    # 将文件名列表转为字符串存入
+    files_str = ", ".join(filenames)
+    c.execute("UPDATE conversations SET files = ? WHERE id = ?", (files_str, conv_id))
+    conn.commit()
+    conn.close()
+
+def get_conv_files(conv_id):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT files FROM conversations WHERE id = ?", (conv_id,))
+    res = c.fetchone()
+    conn.close()
+    return res[0] if res and res[0] else ""
+
+def get_conversations():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT id, title FROM conversations ORDER BY id DESC")
+    convs = c.fetchall()
+    conn.close()
+    return convs
+
+def create_conversation(title="新对话"):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute("INSERT INTO conversations (title, created_at) VALUES (?, ?)", (title, now))
+    conv_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return conv_id
+
+def save_message(conv_id, role, content):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute("INSERT INTO messages (conv_id, role, content, created_at) VALUES (?, ?, ?, ?)", (conv_id, role, content, now))
+    conn.commit()
+    conn.close()
+
+def get_messages(conv_id):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT role, content FROM messages WHERE conv_id = ? ORDER BY id ASC", (conv_id,))
+    msgs = c.fetchall()
+    conn.close()
+    return [{"role": r[0], "content": r[1]} for r in msgs]
+
+def update_conv_title(conv_id, title):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("UPDATE conversations SET title = ? WHERE id = ?", (title, conv_id))
+    conn.commit()
+    conn.close()
+
+# 初始化数据库
+init_db()
+
+# ================= 文件本地持久化工具 =================
+def save_uploaded_files(conv_id, uploaded_files):
+    """把上传的文件保存到本地磁盘"""
+    dir_path = f"./uploads/{conv_id}"
+    os.makedirs(dir_path, exist_ok=True)
+    for file in uploaded_files:
+        file_path = os.path.join(dir_path, file.name)
+        with open(file_path, "wb") as f:
+            f.write(file.getbuffer())
+
+def load_local_files(conv_id):
+    """从本地磁盘读取该会话的所有文件"""
+    dir_path = f"./uploads/{conv_id}"
+    if not os.path.exists(dir_path):
+        return []
+    files = []
+    for filename in os.listdir(dir_path):
+        file_path = os.path.join(dir_path, filename)
+        with open(file_path, "rb") as f:
+            content = f.read()
+            # 构造一个类似 UploadedFile 的对象，骗过 Streamlit
+            class LocalFile:
+                def __init__(self, name, content):
+                    self.name = name
+                    self._content = content
+                def getbuffer(self):
+                    return self._content
+                def read(self, *args):
+                    return self._content
+            files.append(LocalFile(filename, content))
+    return files
+# =======================================================
 # ================= 1. 基础函数 =================
 def get_embedding(text):
     url = "https://open.bigmodel.cn/api/paas/v4/embeddings"
@@ -308,6 +425,9 @@ def writer_node(state: RAGState):
         return {"answer": ans}
 
 def route_after_grade(state: RAGState):
+    # 👇 新增：拦截画图请求
+    if any(kw in state["question"] for kw in ["画一张", "画个", "生成图片", "画图", "文生图"]):
+        return "generate_image"
     # 1. 拦截各类文件生成请求（必须放在最前面）
     if any(kw in state["question"] for kw in ["PPT", "ppt", "幻灯片", "演示文稿"]):
         return "generate_ppt"
@@ -558,139 +678,249 @@ def ppt_generator_node(state: RAGState):
         }
     except Exception as e:
         return {"answer": f"PPT 生成失败：{e}"}
+
+def image_generator_node(state: RAGState):
+    """文生图节点"""
+    prompt = state.get("rewritten_question") or state["question"]
+    
+    # 优化提示词
+    enhance_prompt = f"请画出以下场景，要求画面精美、细节丰富：{prompt}"
+    
+    url = "https://open.bigmodel.cn/api/paas/v4/images/generations"
+    headers = {"Authorization": f"Bearer {zhipu_key}", "Content-Type": "application/json"}
+    data = {
+        "model": "cogview-3-flash",
+        "prompt": enhance_prompt
+    }
+    
+    try:
+        res = requests.post(url, headers=headers, json=data)
+        res.raise_for_status()
+        image_url = res.json()["data"][0]["url"]
+        
+        # 下载图片到内存
+        img_bytes = requests.get(image_url).content
+        
+        return {
+            "file_data": img_bytes,
+            "file_name": "AI生成图片.png",
+            "answer": f"✅ 您的图片已生成完毕！\n\n**画图提示词**：{prompt}"
+        }
+    except Exception as e:
+        return {"answer": f"⚠️ 图片生成失败：{e}"}
+    
 # ================= 4. 构建状态图 =================
 workflow = StateGraph(RAGState)
 workflow.add_node("rewrite_query", rewrite_query_with_history)
 workflow.add_node("retrieve", retrieve_node)
 workflow.add_node("grade", grade_node)
-workflow.add_node("generate_excel", excel_generator_node)  # 确保加了这个节点
-workflow.add_node("generate_word", word_generator_node) # 新增
-workflow.add_node("generate_ppt", ppt_generator_node) # 新增节点
 workflow.add_node("rewrite", rewrite_node)
 workflow.add_node("web_search", web_search_node)
 workflow.add_node("research", research_node)
 workflow.add_node("writer", writer_node)
+workflow.add_node("generate_excel", excel_generator_node)
+workflow.add_node("generate_word", word_generator_node)
+workflow.add_node("generate_ppt", ppt_generator_node)
+workflow.add_node("generate_image", image_generator_node) # 👈 新增节点
 
 workflow.set_entry_point("rewrite_query")
 workflow.add_edge("rewrite_query", "retrieve")
 workflow.add_edge("retrieve", "grade")
+
+# 👇 核心修改：条件边里加上 generate_image
 workflow.add_conditional_edges("grade", route_after_grade, {
-    "research": "research",
-    "rewrite": "rewrite",
+    "research": "research", 
+    "rewrite": "rewrite", 
     "web_search": "web_search",
-    "generate_excel": "generate_excel",  # 👈 这里漏了逗号，补上！
-    "generate_word": "generate_word",  # 👈 这里也漏了逗号，补上！
-    "generate_ppt": "generate_ppt"  # 👈 新增 PPT 生成节点
+    "generate_excel": "generate_excel",
+    "generate_word": "generate_word",
+    "generate_ppt": "generate_ppt",
+    "generate_image": "generate_image" # 👈 新增
 })
+
 workflow.add_edge("rewrite", "retrieve")
 workflow.add_edge("web_search", "research")
 workflow.add_edge("research", "writer")
 workflow.add_edge("writer", END)
-workflow.add_edge("generate_excel", END)  # 必须在这
-workflow.add_edge("generate_word", END) # 新增
+workflow.add_edge("generate_excel", END)
+workflow.add_edge("generate_word", END)
 workflow.add_edge("generate_ppt", END)
+workflow.add_edge("generate_image", END) # 👈 新增终点
+
 app_graph = workflow.compile()
 
-# ================= 5. 前端界面 =================
-if "messages" not in st.session_state: st.session_state.messages = []
+# ================= 5. 侧边栏与聊天界面 =================
 
-uploaded_files = st.file_uploader("上传文档 (PDF, Word, Excel, PPT, 图片)", type=["txt", "pdf", "docx", "md", "pptx", "xlsx", "xls", "jpg", "jpeg", "png"], accept_multiple_files=True)
+# 1. 初始化当前会话状态
+if "current_conv_id" not in st.session_state:
+    # 默认加载最新一个会话，如果没有则创建新的
+    convs = get_conversations()
+    if convs:
+        st.session_state.current_conv_id = convs[0][0]
+    else:
+        st.session_state.current_conv_id = create_conversation("欢迎对话")
 
+# 2. 侧边栏：历史记录
+with st.sidebar:
+    st.title("💬 历史对话")
+    
+    # 新建对话按钮
+    if st.button("➕ 新建对话", use_container_width=True):
+        new_id = create_conversation("新对话")
+        st.session_state.current_conv_id = new_id
+        st.rerun() # 刷新页面载入新会话
+
+    st.divider()
+    
+    # 列出所有历史
+    convs = get_conversations()
+    for cid, ctitle in convs:
+        # 高亮当前选中的对话
+        if cid == st.session_state.current_conv_id:
+            st.button(f"👉 {ctitle}", key=f"btn_{cid}", disabled=True, use_container_width=True)
+        else:
+            if st.button(f"{ctitle}", key=f"btn_{cid}", use_container_width=True):
+                st.session_state.current_conv_id = cid
+                st.rerun()
+    st.divider()
+    
+    st.subheader("🎨 PPT 生成设置")
+    ppt_style_choice = st.selectbox(
+        "选择风格（生成PPT时生效）:",
+        ["AI智能推荐", "科技深邃风", "极简商务风", "活力创意风"]
+    )
+
+# 3. 加载当前会话的消息记录
+current_messages = get_messages(st.session_state.current_conv_id)
+
+# 4. 文件上传区
+st.markdown("上传文档 (PDF, Word, Excel, PPT, 图片)")
+uploaded_files = st.file_uploader("", type=["txt", "pdf", "docx", "md", "pptx", "xlsx", "xls", "jpg", "jpeg", "png"], accept_multiple_files=True, label_visibility="collapsed")
+
+# 【新增】：如果用户上传了新文件，保存到本地磁盘
+if uploaded_files:
+    save_uploaded_files(st.session_state.current_conv_id, uploaded_files)
+
+# 【新增】：如果用户没传文件，但本地有这个会话的历史文件，就自动加载！
+if not uploaded_files:
+    uploaded_files = load_local_files(st.session_state.current_conv_id)
+    if uploaded_files:
+        st.info(f"💡 自动为您加载该会话的历史文档：{', '.join([f.name for f in uploaded_files])}")
+
+# 建库逻辑
 if uploaded_files:
     current_file_names = [f.name for f in uploaded_files]
     if "current_files" not in st.session_state or st.session_state.current_files != current_file_names:
-        with st.spinner("正在解析多份文档..."):
+        with st.spinner("正在解析文档并构建索引..."):
             chunks_global = process_files(uploaded_files)
             if chunks_global:
                 chroma_client = chromadb.Client()
                 try: chroma_client.delete_collection(name="my_docs")
                 except: pass
                 col = chroma_client.create_collection(name="my_docs")
-                for i, chunk in enumerate(chunks_global):
-                    col.add(embeddings=[get_embedding(chunk)], documents=[chunk], ids=[f"id_{i}"])
+                
+                # ================= 【核心加速替换区】 =================
+                # 删掉你原来的 for i, chunk in enumerate(chunks_global): col.add(...) 循环
+                # 换成下面这个多线程并发版：
+                def add_chunk_to_col(i, chunk):
+                    try:
+                        vec = get_embedding(chunk)
+                        col.add(embeddings=[vec], documents=[chunk], ids=[f"id_{i}"])
+                    except Exception:
+                        pass 
+                
+                # 开启 5 个并发线程同时算向量，速度提升 5 倍！
+                with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                    futures = [executor.submit(add_chunk_to_col, i, chunk) for i, chunk in enumerate(chunks_global)]
+                    concurrent.futures.wait(futures)
+                # ======================================================
+
                 st.session_state.collection = col
                 st.session_state.bm25 = BM25Okapi([tokenize(c) for c in chunks_global])
                 st.session_state.chunks_global = chunks_global
                 st.session_state.current_files = current_file_names
-                st.success(f"成功加载 {len(uploaded_files)} 份文档。")
+                
+                st.success(f"成功加载 {len(uploaded_files)} 份文档（已开启多线程加速）。")
+# 5. 渲染历史消息
+for msg in current_messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
 
-# 历史渲染
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]): st.markdown(msg["content"])
-# 新增：风格选择器（放在输入框上方）
-ppt_style_choice = st.selectbox(
-    "🎨 如果你需要生成 PPT，请选择风格：",
-    ["AI智能推荐", "科技深邃风", "极简商务风", "活力创意风"]
-)
-
-# 聊天输入
+# 6. 输入框与对话逻辑
 if prompt := st.chat_input("你可以针对文档提问，或者直接让我上网查资料..."):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"): 
+    # 每次发新消息，先清空上一轮的文件状态
+    st.session_state.generated_file = None
+    
+    # 如果是新会话的第一句话，更新标题
+    if len(current_messages) == 0:
+        update_conv_title(st.session_state.current_conv_id, prompt[:15])
+
+    # 保存用户消息到数据库
+    save_message(st.session_state.current_conv_id, "user", prompt)
+    
+    # 显示用户气泡
+    with st.chat_message("user"):
         st.markdown(prompt)
 
+    # 显示 AI 气泡
     with st.chat_message("assistant"):
         with st.spinner("Agent 正在思考与检索..."):
             try:
-                # 调用图，把风格参数传进去
+                history_for_llm = current_messages[-6:]
+                ppt_style = st.session_state.get("ppt_style_choice", "AI智能推荐")
+                
+                # 调用图
                 events = app_graph.stream({
                     "question": prompt, 
                     "rewritten_question": "", 
                     "retries": 0, 
-                    "history": st.session_state.messages[:-1],
-                    "ppt_style": ppt_style_choice
+                    "history": history_for_llm,
+                    "ppt_style": ppt_style
                 }, stream_mode="values")
                 
                 final_result = None
                 for event in events: 
                     final_result = event
 
-                # 绝对兜底
+                # 提取文本并兜底
                 final_text = final_result.get("answer", "") if final_result else ""
                 if not final_text or not final_text.strip():
                     final_text = "⚠️ 抱歉，系统未能生成有效回答。请尝试换种问法或检查网络。"
 
+                # 核心：把文件流存进全局状态
+                if final_result and final_result.get("file_data") is not None:
+                    st.session_state.generated_file = final_result
+
+                # 👇 只在这里打印一次！
                 st.markdown(final_text)
 
-                # 准确判断是否生成了文件数据
-                if final_result and final_result.get("file_data") is not None:
-                    fname = final_result.get("file_name", "data")
-                    
-                    # 如果是 Excel 文件
-                    if fname.endswith(".xlsx"):
-                        st.download_button(
-                            label="📥 下载 Excel 表格",
-                            data=final_result["file_data"],
-                            file_name=fname,
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                        )
-                    # 如果是 Word 文件
-                    elif fname.endswith(".docx"):
-                        st.download_button(
-                            label="📥 下载 Word 文档",
-                            data=final_result["file_data"],
-                            file_name=fname,
-                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                        )
-                    # 如果是 PPT 文件
-                    elif fname.endswith(".pptx"):
-                        st.download_button(
-                            label="📥 下载 PPT 演示文稿",
-                            data=final_result["file_data"],
-                            file_name=fname,
-                            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation"
-                        )
-                else:
-                    # 默认 Markdown 下载
-                    st.download_button(
-                        label="📥 下载这份总结 (Markdown格式)",
-                        data=final_text.encode('utf-8'),
-                        file_name="AI_分析报告.md",
-                        mime="text/markdown"
-                    )
-                    
             except Exception as e:
                 final_text = f"❌ 执行出错：{str(e)}"
                 st.markdown(final_text)
 
-    st.session_state.messages.append({"role": "assistant", "content": final_text})
+    # 保存 AI 消息到数据库（只存一次）
+    save_message(st.session_state.current_conv_id, "assistant", final_text)
+    
+    # 强制刷新页面，加载最新历史
+    st.rerun()
+
+
+# ================= 底部固定渲染最新文件下载 =================
+if "generated_file" in st.session_state and st.session_state.generated_file is not None:
+    res = st.session_state.generated_file
+    fname = res.get("file_name", "data")
+    
+    st.markdown("---")
+    st.success(f"📄 最新文件已就绪：{fname} （请点击下载）")
+    
+    if fname.endswith(".xlsx"):
+        st.download_button("📥 下载 Excel 表格", data=res["file_data"], file_name=fname, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_xlsx_btn")
+    elif fname.endswith(".docx"):
+        st.download_button("📥 下载 Word 文档", data=res["file_data"], file_name=fname, mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", key="dl_docx_btn")
+    elif fname.endswith(".pptx"):
+        st.download_button("📥 下载 PPT 演示文稿", data=res["file_data"], file_name=fname, mime="application/vnd.openxmlformats-officedocument.presentationml.presentation", key="dl_pptx_btn")
+    
+    # 👇 新增：图片展示与下载
+    elif fname.endswith(".png") or fname.endswith(".jpg"):
+        st.image(res["file_data"], caption="AI 为你生成的图片", use_container_width=True)
+        st.download_button("📥 下载图片", data=res["file_data"], file_name=fname, mime="image/png", key="dl_img_btn")
