@@ -65,18 +65,23 @@ DB_FILE = "chat_history.db"
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS experiences
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, task_type TEXT, lesson TEXT)''')
+    # 用户表 (简单模拟多租户)
+    c.execute('''CREATE TABLE IF NOT EXISTS users
+                 (id TEXT PRIMARY KEY, balance REAL DEFAULT 100.0)''') # 默认送100额度
     # 会话表
     c.execute('''CREATE TABLE IF NOT EXISTS conversations
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, created_at TEXT)''')
-    # 消息表
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, title TEXT, created_at TEXT, files TEXT)''')
+    # 消息表 (增加成本记录)
     c.execute('''CREATE TABLE IF NOT EXISTS messages
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT, conv_id INTEGER, role TEXT, content TEXT, created_at TEXT)''')
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, conv_id INTEGER, user_id TEXT, role TEXT, content TEXT, cost REAL DEFAULT 0, created_at TEXT)''')
     
-    # 【核心修复】：自动检测并添加 files 列，防止旧版本报错
-    try:
-        c.execute("ALTER TABLE conversations ADD COLUMN files TEXT")
-    except sqlite3.OperationalError:
-        pass # 如果列已经存在，会报错，直接跳过
+    # 兼容旧表
+    try: c.execute("ALTER TABLE conversations ADD COLUMN files TEXT")
+    except: pass
+    try: c.execute("ALTER TABLE messages ADD COLUMN cost REAL DEFAULT 0")
+    except: pass
         
     conn.commit()
     conn.close()
@@ -375,19 +380,27 @@ def web_search_node(state: RAGState):
         return {"context": f"【网络搜索报错：{str(e)}】", "is_relevant": "yes"}
 
 def research_node(state: RAGState):
-    safe_context = state['context'][:3000] 
+    safe_context = state['context'][:3000]
     
     if "【网络搜索" in state["context"] and len(safe_context) < 150:
         return {"answer": f"⚠️ {safe_context}"}
         
-    if "【来源网页：" in state["context"]:
-        # 【放宽常识判断】：允许大模型根据自己的常识和搜索片段结合回答
-        prompt = f"""你是一个智能问答助手。请根据以下搜索片段，回答用户的问题。
-要求：如果片段中有具体数据，直接给数据。如果是常识类问题（如穿什么衣服），请结合片段和你的常识给出合理建议。如果没有查到任何相关的信息，才回答“未搜索到最新数据”。
+    # 【核心：读取经验池】
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT lesson FROM experiences ORDER BY id DESC LIMIT 3")
+    lessons = c.fetchall()
+    conn.close()
+    experience_prompt = ""
+    if lessons:
+        experience_prompt = "【历史经验教训，请务必吸取】：\n" + "\n".join([f"- {l[0]}" for l in lessons])
 
+    if "【来源网页：" in state["context"]:
+        prompt = f"""你是一个极简的搜索问答助手。请根据以下搜索片段，直接提取出用户问题的核心答案。
+{experience_prompt}  # 👈 注入经验
+要求：如果查到了数据，直接给结果。如果没有查到确切数据，直接回答“未搜索到最新实时数据”。
 搜索片段：
 {safe_context}
-
 用户问题：{state['question']}
 答案："""
         try:
@@ -719,6 +732,26 @@ def image_generator_node(state: RAGState):
         }
     except Exception as e:
         return {"answer": f"⚠️ 图片生成失败：{e}"}
+# ================= 反思节点（数据飞轮） =================
+def reflection_node(state: RAGState):
+    """当任务失败时，自己反思并存入经验池"""
+    prompt = f"""任务失败了。用户的问题是：{state['question']}。
+我们得到的上下文是：{state.get('context', '无')[:500]}
+请分析失败原因（比如：搜索词太宽泛？没抓到实时数据？），并生成一条简短的“经验教训”，用于下次改进。只输出教训，不要废话。"""
+    try:
+        res = client.chat.completions.create(model="deepseek-chat", messages=[{"role": "user", "content": prompt}], temperature=0.3)
+        lesson = res.choices[0].message.content.strip()
+        
+        # 存入数据库
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("INSERT INTO experiences (task_type, lesson) VALUES (?, ?)", ("general", lesson))
+        conn.commit()
+        conn.close()
+        return {"answer": f"⚠️ 任务执行失败，但 AI 已经学到了：{lesson}"}
+    except Exception as e:
+        return {"answer": f"任务失败，反思也失败了：{e}"}
+    
     
 # ================= 4. 构建状态图 =================
 workflow = StateGraph(RAGState)
@@ -729,6 +762,7 @@ workflow.add_node("rewrite", rewrite_node)
 workflow.add_node("web_search", web_search_node)
 workflow.add_node("research", research_node)
 workflow.add_node("writer", writer_node)
+workflow.add_node("reflection", reflection_node) # 👈 新增反思节点
 workflow.add_node("generate_excel", excel_generator_node)
 workflow.add_node("generate_word", word_generator_node)
 workflow.add_node("generate_ppt", ppt_generator_node)
@@ -773,6 +807,19 @@ if "current_conv_id" not in st.session_state:
 
 # 2. 侧边栏：历史记录
 with st.sidebar:
+    st.title("💬 历史对话")
+    # 显示用户余额
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT balance FROM users WHERE id = 'default_user'")
+    balance = c.fetchone()
+    conn.close()
+    if not balance:
+        conn = sqlite3.connect(DB_FILE)
+        conn.execute("INSERT INTO users (id) VALUES ('default_user')")
+        conn.commit(); conn.close()
+        balance = (100.0,)
+    st.markdown(f"💰 **账户余额：¥{balance[0]:.2f}**")
     st.title("💬 历史对话")
     
     # 新建对话按钮
@@ -895,6 +942,14 @@ if prompt := st.chat_input("你可以针对文档提问，或者直接让我上�
 
                 # 提取文本并兜底
                 final_text = final_result.get("answer", "") if final_result else ""
+                
+                # 👇 新增：如果大模型返回空、或者带有报错字眼，触发反思！
+                if not final_text.strip() or "⚠️" in final_text:
+                    # 直接调用你的反思节点逻辑
+                    reflection_result = reflection_node(final_result if final_result else {"question": prompt, "context": ""})
+                    final_text = reflection_result.get("answer", "任务失败")
+
+                st.markdown(final_text)
                 if not final_text or not final_text.strip():
                     final_text = "⚠️ 抱歉，系统未能生成有效回答。请尝试换种问法或检查网络。"
 
@@ -909,9 +964,16 @@ if prompt := st.chat_input("你可以针对文档提问，或者直接让我上�
                 final_text = f"❌ 执行出错：{str(e)}"
                 st.markdown(final_text)
 
-    # 保存 AI 消息到数据库（只存一次）
-    save_message(st.session_state.current_conv_id, "assistant", final_text)
+    # 保存 AI 消息到数据库，并记录成本（这里简单按次扣费，真实场景按 Token 算）
+    call_cost = 0.05 
+    save_message(st.session_state.current_conv_id, "assistant", final_text, call_cost)
     
+    # 扣除用户余额
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("UPDATE users SET balance = balance - ? WHERE id = 'default_user'", (call_cost,))
+    conn.commit()
+    conn.close()
     # 强制刷新页面，加载最新历史
     st.rerun()
 
