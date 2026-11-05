@@ -6,8 +6,16 @@ import numpy as np
 import jieba
 import docx
 import pandas as pd
+from docx import Document
+from docx.shared import Pt, Inches, RGBColor as DocxRGBColor
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+import io
+import json
 import base64
 from pptx import Presentation
+from pptx.util import Inches, Pt
+from pptx.enum.text import PP_ALIGN
+from pptx.dml.color import RGBColor
 from typing import TypedDict, List
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -27,7 +35,27 @@ tavily_key = os.getenv("TAVILY_API_KEY")
 
 client = OpenAI(api_key=ds_key, base_url="https://api.deepseek.com")
 tavily_client = TavilyClient(api_key=tavily_key) if tavily_key else None
-
+# ================= 0. PPT 风格配置 =================
+PPT_THEMES = {
+    "科技深邃风": {
+        "bg": RGBColor(30, 32, 38),      # 极深灰背景
+        "title": RGBColor(255, 255, 255), # 纯白标题
+        "text": RGBColor(200, 205, 210),  # 灰白正文
+        "accent": RGBColor(0, 150, 255),  # 亮蓝色装饰条
+    },
+    "极简商务风": {
+        "bg": RGBColor(248, 249, 250),    # 极浅灰背景
+        "title": RGBColor(33, 37, 41),    # 深黑灰标题
+        "text": RGBColor(73, 80, 87),     # 深灰正文
+        "accent": RGBColor(40, 167, 69),  # 墨绿色装饰条
+    },
+    "活力创意风": {
+        "bg": RGBColor(255, 248, 225),    # 奶黄色背景
+        "title": RGBColor(211, 47, 47),   # 砖红色标题
+        "text": RGBColor(62, 39, 35),     # 深咖色正文
+        "accent": RGBColor(255, 152, 0),  # 亮橙色装饰条
+    }
+}
 # ================= 1. 基础函数 =================
 def get_embedding(text):
     url = "https://open.bigmodel.cn/api/paas/v4/embeddings"
@@ -117,6 +145,9 @@ class RAGState(TypedDict):
     retries: int
     answer: str
     history: List[dict]
+    file_data: bytes  # 用来存生成的 Excel 文件内容
+    file_name: str    # 文件名
+    ppt_style: str  # 👈 新增这一行，用于接收前端选择的风格
 
 # 新增：将多轮对话合并为独立问题，解决上下文断片
 def rewrite_query_with_history(state: RAGState):
@@ -126,10 +157,12 @@ def rewrite_query_with_history(state: RAGState):
     
     history_str = "\n".join([f"{m['role']}: {m['content']}" for m in history[-4:]])
     prompt = f"""根据以下对话历史，将用户的最后一个问题重写为一个独立的、包含完整上下文的查询语句。
-【核心规则】：
-1. 如果用户的最后问题是“那明天呢”、“未来7天呢”、“后天呢”，必须结合历史记录，补全城市或实体名称！（例如：如果历史在聊南昌天气，重写结果必须是“南昌未来7天天气”）。
-2. 如果用户提到了“根据文档”、“结合上文”，必须在重写结果中保留。
-3. 只输出重写后的句子，绝对不要任何解释。
+
+【极其重要的规则】：
+1. 如果用户的最后问题是“那明天呢”、“后天呢”、“未来几天呢”，你必须去历史记录里找到对应的【地点】或【实体】。
+2. 绝对禁止自己编造或猜测未出现的地点（例如，如果历史里说的是南昌，重写结果必须是“南昌明天天气”，绝不能是纽约）。
+3. 如果历史记录中实在找不到相关实体，请直接输出原问题。
+4. 只输出重写后的句子，绝对不要任何解释。
 
 历史：
 {history_str}
@@ -204,15 +237,22 @@ def rewrite_node(state: RAGState):
 def web_search_node(state: RAGState):
     if not tavily_client:
         return {"context": "【网络搜索接口未配置】请检查 TAVILY_API_KEY。", "is_relevant": "yes"}
+    
+    # 优先用重写后的问题去搜
     query = state.get("rewritten_question") or state.get("standalone_query") or state["question"]
+    
+    # 【兜底】：如果经过层层重写，搜索词居然还是只有两三个字（如“明天呢”），强制加上历史里的实体
+    if len(query) <= 4 and state.get("history"):
+        # 简单粗暴：把上一句用户的话和这句话拼起来搜
+        last_user_msg = next((m['content'] for m in reversed(state['history']) if m['role'] == 'user'), "")
+        query = f"{last_user_msg} {query}"
+
     try:
         response = tavily_client.search(query=query, search_depth="basic", max_results=3)
         valid_results = [r for r in response.get("results", []) if r.get("content")]
         if not valid_results:
             return {"context": f"【网络搜索】未找到关于 '{query}' 的有效结果。", "is_relevant": "yes"}
-        
-        # 【核心清洗】：只取每个网页正文的前 500 个字符，直接扔掉网页底部的导航和广告
-        web_context = "\n\n".join([f"【来源网页：{r['url']}】\n{r['content'][:500]}" for r in valid_results])
+        web_context = "\n\n".join([f"【来源网页：{r['url']}】\n{r['content'][:800]}" for r in valid_results])
         return {"context": web_context, "is_relevant": "yes"}
     except Exception as e:
         return {"context": f"【网络搜索报错：{str(e)}】", "is_relevant": "yes"}
@@ -268,23 +308,264 @@ def writer_node(state: RAGState):
         return {"answer": ans}
 
 def route_after_grade(state: RAGState):
-    if "【无本地文档】" in state["context"]: return "web_search"
-    
-    # 如果是强制本地问题，直接去 research，绝对不准去联网
+    # 1. 拦截各类文件生成请求（必须放在最前面）
+    if any(kw in state["question"] for kw in ["PPT", "ppt", "幻灯片", "演示文稿"]):
+        return "generate_ppt"
+    if any(kw in state["question"] for kw in ["Word", "word", "公文"]):
+        return "generate_word"
+    if any(kw in state["question"] for kw in ["表格", "Excel", "excel"]):
+        return "generate_excel"
+
+    # 2. 如果没有本地文档，直接去联网
+    if "【无本地文档】" in state["context"]: 
+        return "web_search"
+
+    # 3. 强制本地搜索逻辑（用户说了“结合文档”等）
     q_check = state.get("standalone_query", "") + state["question"]
     force_local_keywords = ["结合文档", "根据文档", "根据资料", "结合资料", "文中", "根据上文"]
     if any(kw in q_check for kw in force_local_keywords):
         return "research"
 
-    if state["is_relevant"] == "yes": return "research"
-    if state.get("retries", 0) >= 1: return "web_search"
+    # 4. 常规判断逻辑
+    if state["is_relevant"] == "yes": 
+        return "research"
+    if state.get("retries", 0) >= 1: 
+        return "web_search"
+        
     return "rewrite"
+        
+import io  # 如果最上面没有，记得加上
+import json
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
+def excel_generator_node(state: RAGState):
+    """生成带高级样式的 Excel 表格"""
+    prompt = f"""请根据以下信息，提取或生成用户需要的表格数据。
+要求：必须输出标准的 JSON 格式，包含两个键：'headers'（表头列表）和 'data'（二维数组数据）。不要输出任何其他废话。
+
+用户需求：{state['question']}
+参考资料：{state['context'][:4000]}
+"""
+    try:
+        res = client.chat.completions.create(model="deepseek-chat", messages=[{"role": "user", "content": prompt}], temperature=0)
+        content = res.choices[0].message.content.strip()
+        if content.startswith("```json"): content = content.replace("```json", "").replace("```", "").strip()
+        
+        json_data = json.loads(content)
+        
+        # 1. 用 pandas 生成基础数据
+        df = pd.DataFrame(json_data["data"], columns=json_data["headers"])
+        output = io.BytesIO()
+        
+        # 2. 用 openpyxl 进行深度美化
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            df.to_excel(writer, index=False, sheet_name='核心数据')
+            workbook = writer.book
+            worksheet = writer.sheets['核心数据']
+            
+            # 定义样式
+            header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid") # 深蓝背景
+            header_font = Font(color="FFFFFF", bold=True, size=12) # 白色加粗字体
+            center_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            thin_border = Border(left=Side(style='thin', color='D3D3D3'), 
+                                 right=Side(style='thin', color='D3D3D3'), 
+                                 top=Side(style='thin', color='D3D3D3'), 
+                                 bottom=Side(style='thin', color='D3D3D3'))
+            
+            # 美化表头
+            for col_num, column_title in enumerate(df.columns, 1):
+                cell = worksheet.cell(row=1, column=col_num)
+                cell.fill = header_fill
+                cell.font = header_font
+                cell.alignment = center_align
+                cell.border = thin_border
+                worksheet.row_dimensions[1].height = 25  # 调高表头行高
+                
+            # 美化正文（斑马线、居中、边框）
+            for row_num in range(2, len(df) + 2):
+                for col_num in range(1, len(df.columns) + 1):
+                    cell = worksheet.cell(row=row_num, column=col_num)
+                    cell.alignment = center_align
+                    cell.border = thin_border
+                    # 偶数行加浅灰背景
+                    if row_num % 2 == 0:
+                        cell.fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
+                        
+            # 自适应列宽
+            for col_num, column_title in enumerate(df.columns, 1):
+                column_letter = get_column_letter(col_num)
+                max_length = max(len(str(column_title)), max([len(str(val)) for val in df.iloc[:, col_num-1]]))
+                worksheet.column_dimensions[column_letter].width = min(max_length + 4, 50) # 限制最大宽度
+                
+            # 冻结首行
+            worksheet.freeze_panes = "A2"
+
+        output.seek(0)
+        return {
+            "file_data": output.getvalue(),
+            "file_name": "高颜值数据报表.xlsx",
+            "answer": "✅ 带高级排版的 Excel 数据表已生成，请下载查看！"
+        }
+    except Exception as e:
+        return {"answer": f"表格生成失败：{e}"}
+    
+
+def word_generator_node(state: RAGState):
+    """生成带高级排版的 Word 文档"""
+    prompt = f"""请根据以下信息，撰写一份完整的 Word 文档。
+要求：只输出正文内容，使用 '#' 表示一级标题，'##' 表示二级标题，'###' 表示三级标题，'-' 表示列表项。不要包含任何解释。
+
+用户需求：{state['question']}
+参考资料：{state['context'][:5000]}
+"""
+    try:
+        res = client.chat.completions.create(model="deepseek-chat", messages=[{"role": "user", "content": prompt}], temperature=0.3)
+        text_content = res.choices[0].message.content.strip()
+
+        doc = Document()
+        
+        # 设置全局默认字体
+        style = doc.styles['Normal']
+        style.font.name = 'Microsoft YaHei'  # 微软雅黑
+        style.font.size = Pt(11)
+        
+                # 解析文本并写入
+        for line in text_content.split('\n'):
+            line = line.strip()
+            if not line: continue
+            # 忽略掉大模型可能输出的四级标题符号
+            if line.startswith('#### '):
+                heading = doc.add_heading(line.replace('#### ', ''), level=3)
+                heading.style.font.name = 'Microsoft YaHei'
+                heading.runs[0].font.color.rgb = DocxRGBColor(0x1F, 0x4E, 0x78)
+            elif line.startswith('### '):
+                heading = doc.add_heading(line.replace('## ', ''), level=2)
+                heading.style.font.name = 'Microsoft YaHei'
+                heading.runs[0].font.color.rgb = DocxRGBColor(0x1F, 0x4E, 0x78) # 统一用 DocxRGBColor
+            elif line.startswith('# '):
+                heading = doc.add_heading(line.replace('# ', ''), level=1)
+                heading.style.font.name = 'Microsoft YaHei'
+                heading.runs[0].font.color.rgb = DocxRGBColor(0x00, 0x00, 0x00) # 统一用 DocxRGBColor
+                heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            elif line.startswith('- '):
+                p = doc.add_paragraph(style='List Bullet')
+                run = p.add_run(line.replace('- ', ''))
+                run.font.name = 'Microsoft YaHei'
+                p.paragraph_format.line_spacing = 1.5
+            else:
+                p = doc.add_paragraph()
+                run = p.add_run(line)
+                run.font.name = 'Microsoft YaHei'
+                p.paragraph_format.line_spacing = 1.5
+                # 注意这里是 12 个空格缩进，必须在 else 块里
+                p.paragraph_format.first_line_indent = Inches(0.3) # 用 Inches 替代 Pt 避免冲突
+
+        output = io.BytesIO()
+        doc.save(output)
+        output.seek(0)
+
+        return {
+            "file_data": output.getvalue(),
+            "file_name": "专业公文报告.docx",
+            "answer": "✅ 带公文排版的 Word 文档已生成，请点击下方按钮下载。"
+        }
+    except Exception as e:
+        return {"answer": f"Word 生成失败：{e}"}
+def ppt_generator_node(state: RAGState):
+    """带风格切换的 PPT 生成节点"""
+    # 1. 确定风格：如果是智能推荐，让大模型判断
+    style_name = state.get("ppt_style", "极简商务风")
+    if style_name == "AI智能推荐":
+        style_prompt = f"分析以下内容，判断最适合的PPT风格。只输出风格名称，必须从以下三个中选一个：[科技深邃风, 极简商务风, 活力创意风]。内容：{state['question']} {state['context'][:500]}"
+        try:
+            style_res = client.chat.completions.create(model="deepseek-chat", messages=[{"role": "user", "content": style_prompt}], temperature=0)
+            style_name = style_res.choices[0].message.content.strip()
+        except:
+            style_name = "极简商务风"
+    
+    # 如果大模型乱说，默认兜底为商务风
+    if style_name not in PPT_THEMES:
+        style_name = "极简商务风"
+    theme = PPT_THEMES[style_name]
+
+    # 2. 生成内容结构
+    prompt = f"""请根据以下信息策划 PPT。输出严格 JSON 格式：'slides' 列表。
+每页包含 'title'（标题）和 'bullet_points'（3-5个要点）。不要有任何多余解释。
+
+用户需求：{state['question']}
+参考资料：{state['context'][:5000]}
+"""
+    try:
+        res = client.chat.completions.create(model="deepseek-chat", messages=[{"role": "user", "content": prompt}], temperature=0.2)
+        content = res.choices[0].message.content.strip()
+        if content.startswith("```json"): content = content.replace("```json", "").replace("```", "").strip()
+        ppt_data = json.loads(content)
+        
+        # 3. 渲染引擎
+        prs = Presentation()
+        prs.slide_width = Inches(13.333)
+        prs.slide_height = Inches(7.5)
+        blank_layout = prs.slide_layouts[6]
+        
+        # --- 封面页 ---
+        slide = prs.slides.add_slide(blank_layout)
+        bg = slide.shapes.add_shape(1, 0, 0, prs.slide_width, prs.slide_height)
+        bg.fill.solid(); bg.fill.fore_color.rgb = theme["bg"]; bg.line.fill.background()
+
+        title_box = slide.shapes.add_textbox(Inches(1), Inches(2.5), Inches(11), Inches(2))
+        p = title_box.text_frame.add_paragraph()
+        p.text = ppt_data["slides"][0].get("title", "AI 汇报")
+        p.font.size = Pt(54); p.font.bold = True; p.font.color.rgb = theme["title"]; p.alignment = PP_ALIGN.CENTER
+
+        subtitle_box = slide.shapes.add_textbox(Inches(1), Inches(4.5), Inches(11), Inches(1))
+        p_sub = subtitle_box.text_frame.add_paragraph()
+        p_sub.text = f"由 Agentic RAG 生成 | 风格：{style_name}"
+        p_sub.font.size = Pt(24); p_sub.font.color.rgb = theme["text"]; p_sub.alignment = PP_ALIGN.CENTER
+
+        # --- 内容页 ---
+        for slide_data in ppt_data["slides"][1:]:
+            slide = prs.slides.add_slide(blank_layout)
+            
+            # 背景
+            bg = slide.shapes.add_shape(1, 0, 0, prs.slide_width, prs.slide_height)
+            bg.fill.solid(); bg.fill.fore_color.rgb = theme["bg"]; bg.line.fill.background()
+            
+            # 左侧强调竖条装饰
+            accent_bar = slide.shapes.add_shape(1, Inches(0.8), Inches(1), Inches(0.15), Inches(5.5))
+            accent_bar.fill.solid(); accent_bar.fill.fore_color.rgb = theme["accent"]; accent_bar.line.fill.background()
+
+            # 标题
+            title_box = slide.shapes.add_textbox(Inches(1.2), Inches(1), Inches(11), Inches(1))
+            p = title_box.text_frame.add_paragraph()
+            p.text = slide_data.get("title", "标题")
+            p.font.size = Pt(36); p.font.bold = True; p.font.color.rgb = theme["title"]
+
+            # 正文
+            body_box = slide.shapes.add_textbox(Inches(1.2), Inches(2.2), Inches(10.5), Inches(4.5))
+            tf_body = body_box.text_frame; tf_body.word_wrap = True
+            for i, point in enumerate(slide_data.get("bullet_points", [])):
+                p = tf_body.paragraphs[0] if i == 0 else tf_body.add_paragraph()
+                p.text = f"•  {point}"
+                p.font.size = Pt(24); p.font.color.rgb = theme["text"]; p.space_after = Pt(15)
+
+        output = io.BytesIO()
+        prs.save(output); output.seek(0)
+        return {
+            "file_data": output.getvalue(),
+            "file_name": f"汇报_{style_name}.pptx",
+            "answer": f"✅ 已生成【{style_name}】风格的 PPT 演示文稿！"
+        }
+    except Exception as e:
+        return {"answer": f"PPT 生成失败：{e}"}
 # ================= 4. 构建状态图 =================
 workflow = StateGraph(RAGState)
 workflow.add_node("rewrite_query", rewrite_query_with_history)
 workflow.add_node("retrieve", retrieve_node)
 workflow.add_node("grade", grade_node)
+workflow.add_node("generate_excel", excel_generator_node)  # 确保加了这个节点
+workflow.add_node("generate_word", word_generator_node) # 新增
+workflow.add_node("generate_ppt", ppt_generator_node) # 新增节点
 workflow.add_node("rewrite", rewrite_node)
 workflow.add_node("web_search", web_search_node)
 workflow.add_node("research", research_node)
@@ -293,11 +574,21 @@ workflow.add_node("writer", writer_node)
 workflow.set_entry_point("rewrite_query")
 workflow.add_edge("rewrite_query", "retrieve")
 workflow.add_edge("retrieve", "grade")
-workflow.add_conditional_edges("grade", route_after_grade, {"research": "research", "rewrite": "rewrite", "web_search": "web_search"})
+workflow.add_conditional_edges("grade", route_after_grade, {
+    "research": "research",
+    "rewrite": "rewrite",
+    "web_search": "web_search",
+    "generate_excel": "generate_excel",  # 👈 这里漏了逗号，补上！
+    "generate_word": "generate_word",  # 👈 这里也漏了逗号，补上！
+    "generate_ppt": "generate_ppt"  # 👈 新增 PPT 生成节点
+})
 workflow.add_edge("rewrite", "retrieve")
 workflow.add_edge("web_search", "research")
 workflow.add_edge("research", "writer")
 workflow.add_edge("writer", END)
+workflow.add_edge("generate_excel", END)  # 必须在这
+workflow.add_edge("generate_word", END) # 新增
+workflow.add_edge("generate_ppt", END)
 app_graph = workflow.compile()
 
 # ================= 5. 前端界面 =================
@@ -326,35 +617,80 @@ if uploaded_files:
 # 历史渲染
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]): st.markdown(msg["content"])
+# 新增：风格选择器（放在输入框上方）
+ppt_style_choice = st.selectbox(
+    "🎨 如果你需要生成 PPT，请选择风格：",
+    ["AI智能推荐", "科技深邃风", "极简商务风", "活力创意风"]
+)
 
 # 聊天输入
 if prompt := st.chat_input("你可以针对文档提问，或者直接让我上网查资料..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"): st.markdown(prompt)
+    with st.chat_message("user"): 
+        st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        with st.spinner("Agent 正在思考..."):
+        with st.spinner("Agent 正在思考与检索..."):
             try:
-                # 调用图
-                events = app_graph.stream({"question": prompt, "rewritten_question": "", "retries": 0, "history": st.session_state.messages[:-1]}, stream_mode="values")
-                final_result = None
-                for event in events: final_result = event
+                # 调用图，把风格参数传进去
+                events = app_graph.stream({
+                    "question": prompt, 
+                    "rewritten_question": "", 
+                    "retries": 0, 
+                    "history": st.session_state.messages[:-1],
+                    "ppt_style": ppt_style_choice
+                }, stream_mode="values")
                 
+                final_result = None
+                for event in events: 
+                    final_result = event
+
                 # 绝对兜底
                 final_text = final_result.get("answer", "") if final_result else ""
                 if not final_text or not final_text.strip():
                     final_text = "⚠️ 抱歉，系统未能生成有效回答。请尝试换种问法或检查网络。"
 
                 st.markdown(final_text)
-                
-                st.download_button("📥 下载这份总结", data=final_text.encode('utf-8'), file_name="Report.md", mime="text/markdown")
-                
-                with st.expander("🔍 查看底层检索逻辑"):
-                    st.write(f"**重写后的独立搜索词**：{final_result.get('standalone_query', '无')}")
-                    st.write(f"**当前上下文**：\n{final_result.get('context', '无')}")
+
+                # 准确判断是否生成了文件数据
+                if final_result and final_result.get("file_data") is not None:
+                    fname = final_result.get("file_name", "data")
+                    
+                    # 如果是 Excel 文件
+                    if fname.endswith(".xlsx"):
+                        st.download_button(
+                            label="📥 下载 Excel 表格",
+                            data=final_result["file_data"],
+                            file_name=fname,
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        )
+                    # 如果是 Word 文件
+                    elif fname.endswith(".docx"):
+                        st.download_button(
+                            label="📥 下载 Word 文档",
+                            data=final_result["file_data"],
+                            file_name=fname,
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                        )
+                    # 如果是 PPT 文件
+                    elif fname.endswith(".pptx"):
+                        st.download_button(
+                            label="📥 下载 PPT 演示文稿",
+                            data=final_result["file_data"],
+                            file_name=fname,
+                            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                        )
+                else:
+                    # 默认 Markdown 下载
+                    st.download_button(
+                        label="📥 下载这份总结 (Markdown格式)",
+                        data=final_text.encode('utf-8'),
+                        file_name="AI_分析报告.md",
+                        mime="text/markdown"
+                    )
                     
             except Exception as e:
                 final_text = f"❌ 执行出错：{str(e)}"
                 st.markdown(final_text)
-                
+
     st.session_state.messages.append({"role": "assistant", "content": final_text})
