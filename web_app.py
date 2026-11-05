@@ -680,17 +680,28 @@ def ppt_generator_node(state: RAGState):
         return {"answer": f"PPT 生成失败：{e}"}
 
 def image_generator_node(state: RAGState):
-    """文生图节点"""
-    prompt = state.get("rewritten_question") or state["question"]
+    """文生图节点（带提示词扩写）"""
+    user_prompt = state.get("rewritten_question") or state["question"]
     
-    # 优化提示词
-    enhance_prompt = f"请画出以下场景，要求画面精美、细节丰富：{prompt}"
+    # 1. 让 DeepSeek 先扩写提示词
+    prompt_enhance = f"""你是一个顶级的 AI 绘画提示词专家。请将用户的简单指令扩写为一段细节丰富、画面精美的绘画提示词。
+要求：包含主体、环境、光影、画质、风格等描述。直接输出扩写后的提示词，不要任何废话。
+
+用户指令：{user_prompt}
+扩写后的提示词："""
     
+    try:
+        res_llm = client.chat.completions.create(model="deepseek-chat", messages=[{"role": "user", "content": prompt_enhance}], temperature=0.7)
+        enhanced_prompt = res_llm.choices[0].message.content.strip()
+    except:
+        enhanced_prompt = f"高质量，杰作，精美的画面：{user_prompt}"
+
+    # 2. 调用智谱 CogView 画图
     url = "https://open.bigmodel.cn/api/paas/v4/images/generations"
     headers = {"Authorization": f"Bearer {zhipu_key}", "Content-Type": "application/json"}
     data = {
         "model": "cogview-3-flash",
-        "prompt": enhance_prompt
+        "prompt": enhanced_prompt
     }
     
     try:
@@ -704,7 +715,7 @@ def image_generator_node(state: RAGState):
         return {
             "file_data": img_bytes,
             "file_name": "AI生成图片.png",
-            "answer": f"✅ 您的图片已生成完毕！\n\n**画图提示词**：{prompt}"
+            "answer": f"✅ 您的图片已生成完毕！\n\n**画图原指令**：{user_prompt}\n\n**AI扩写提示词**：{enhanced_prompt}"
         }
     except Exception as e:
         return {"answer": f"⚠️ 图片生成失败：{e}"}
