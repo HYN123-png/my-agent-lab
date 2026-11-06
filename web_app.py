@@ -120,11 +120,20 @@ def create_conversation(title="新对话"):
     conn.close()
     return conv_id
 
-def save_message(conv_id, role, content):
+def save_message(conv_id, role, content, cost=0):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    c.execute("INSERT INTO messages (conv_id, role, content, created_at) VALUES (?, ?, ?, ?)", (conv_id, role, content, now))
+    
+    # 【核心修复】：自动兼容云端旧版数据库，防止没有 cost 字段报错
+    try:
+        c.execute("ALTER TABLE messages ADD COLUMN cost REAL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass  # 如果字段已经存在，忽略报错
+        
+    # 插入消息
+    c.execute("INSERT INTO messages (conv_id, role, content, cost, created_at) VALUES (?, ?, ?, ?, ?)", 
+              (conv_id, role, content, cost, now))
     conn.commit()
     conn.close()
 
